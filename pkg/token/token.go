@@ -36,9 +36,12 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/aws/aws-sdk-go/service/sts/stsiface"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/pkg/apis/clientauthentication"
+	clientauthv1 "k8s.io/client-go/pkg/apis/clientauthentication/v1"
+	clientauthv1alpha1 "k8s.io/client-go/pkg/apis/clientauthentication/v1alpha1"
 	clientauthv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
 	"sigs.k8s.io/aws-iam-authenticator/pkg"
 	"sigs.k8s.io/aws-iam-authenticator/pkg/arn"
@@ -176,12 +179,13 @@ type Generator interface {
 	// GetWithSTS returns a token valid for clusterID using the given STS client.
 	GetWithSTS(clusterID string, stsAPI stsiface.STSAPI) (Token, error)
 	// FormatJSON returns the client auth formatted json for the ExecCredential auth
-	FormatJSON(Token) string
+	FormatJSON(Token) (string, error)
 }
 
 type generator struct {
 	forwardSessionName bool
 	cache              bool
+	getEnvFunc         func(string) string
 }
 
 // NewGenerator creates a Generator and returns it.
@@ -189,6 +193,7 @@ func NewGenerator(forwardSessionName bool, cache bool) (Generator, error) {
 	return generator{
 		forwardSessionName: forwardSessionName,
 		cache:              cache,
+		getEnvFunc:         os.Getenv,
 	}, nil
 }
 
@@ -255,7 +260,7 @@ func (g generator) GetWithOptions(options *GetTokenOptions) (Token, error) {
 		if g.cache {
 			// figure out what profile we're using
 			var profile string
-			if v := os.Getenv("AWS_PROFILE"); len(v) > 0 {
+			if v := g.getEnvFunc("AWS_PROFILE"); len(v) > 0 {
 				profile = v
 			} else {
 				profile = session.DefaultSharedConfigProfile
@@ -340,29 +345,75 @@ func (g generator) GetWithSTS(clusterID string, stsAPI stsiface.STSAPI) (Token, 
 }
 
 // FormatJSON formats the json to support ExecCredential authentication
-func (g generator) FormatJSON(token Token) string {
+func (g generator) FormatJSON(token Token) (string, error) {
+	env := g.getEnvFunc(execInfoEnvKey)
+	expirationTimestamp := metav1.NewTime(token.Expiration)
+	/*
+		From to client-go 1.11 through 1.19, KUBERNETES_EXEC_INFO was only set if
+		the kubeconfig specified client.authentication.k8s.io/v1alpha1. If the
+		kubeconfig specified client.authentication.k8s.io/v1beta1, client-go would
+		execute the credential process, but leave KUBERNETES_EXEC_INFO unset.
+		This was fixed in kubernetes/kubernetes#95489 and released in 1.20.
+
+		We can make an educated guess that when the KUBERNETES_EXEC_INFO is unset,
+		we are being called by a pre 1.20 client-go that is expecting the v1beta1
+		API version.
+
+		If we respond with an API version different than specified in the
+		kubeconfig, client-go will return an error.
+	*/
 	apiVersion := clientauthv1beta1.SchemeGroupVersion.String()
-	env := os.Getenv(execInfoEnvKey)
 	if env != "" {
 		cred := &clientauthentication.ExecCredential{}
-		if err := json.Unmarshal([]byte(env), cred); err == nil {
-			apiVersion = cred.APIVersion
+		err := json.Unmarshal([]byte(env), cred)
+		if err != nil {
+			return "", errors.WithMessage(err, "unable to parse KUBERNETES_EXEC_INFO")
 		}
+		apiVersion = cred.APIVersion
 	}
 
-	expirationTimestamp := metav1.NewTime(token.Expiration)
-	execInput := &clientauthv1beta1.ExecCredential{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: apiVersion,
-			Kind:       kindExecCredential,
-		},
-		Status: &clientauthv1beta1.ExecCredentialStatus{
-			ExpirationTimestamp: &expirationTimestamp,
-			Token:               token.Token,
-		},
+	switch apiVersion {
+	case clientauthv1alpha1.SchemeGroupVersion.String():
+		execInput := &clientauthv1alpha1.ExecCredential{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: apiVersion,
+				Kind:       kindExecCredential,
+			},
+			Status: &clientauthv1alpha1.ExecCredentialStatus{
+				ExpirationTimestamp: &expirationTimestamp,
+				Token:               token.Token,
+			},
+		}
+		enc, _ := json.Marshal(execInput)
+		return string(enc), nil
+	case clientauthv1beta1.SchemeGroupVersion.String():
+		execInput := &clientauthv1beta1.ExecCredential{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: apiVersion,
+				Kind:       kindExecCredential,
+			},
+			Status: &clientauthv1beta1.ExecCredentialStatus{
+				ExpirationTimestamp: &expirationTimestamp,
+				Token:               token.Token,
+			},
+		}
+		enc, _ := json.Marshal(execInput)
+		return string(enc), nil
+	case clientauthv1.SchemeGroupVersion.String():
+		execInput := &clientauthv1.ExecCredential{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: apiVersion,
+				Kind:       kindExecCredential,
+			},
+			Status: &clientauthv1.ExecCredentialStatus{
+				ExpirationTimestamp: &expirationTimestamp,
+				Token:               token.Token,
+			},
+		}
+		enc, _ := json.Marshal(execInput)
+		return string(enc), nil
 	}
-	enc, _ := json.Marshal(execInput)
-	return string(enc)
+	return "", fmt.Errorf("invalid apiVersion: %s", apiVersion)
 }
 
 // Verifier validates tokens by calling STS and returning the associated identity.

@@ -325,60 +325,100 @@ func TestVerifyCanonicalARN(t *testing.T) {
 	}
 }
 
+func EnvFuncGenerator(env map[string]string) func(string) string {
+	return func(k string) string {
+		v, ok := env[k]
+		if !ok {
+			return ""
+		}
+		return v
+	}
+}
+
 func TestFormatJson(t *testing.T) {
 	cases := []struct {
 		Name             string
-		EnvKey           string
+		EnvFunc          func(string) string
 		ExpectApiVersion string
-		IsMalformedEnv   bool
+		ExpectedErr      error
 	}{
 		{
 			Name:             "Default",
 			ExpectApiVersion: clientauthv1beta1.SchemeGroupVersion.String(),
 		},
 		{
-			Name:             "Malformed KUBERNETES_EXEC_INFO",
-			EnvKey:           "KUBERNETES_EXEC_INFO",
-			IsMalformedEnv:   true,
+			Name: "Malformed KUBERNETES_EXEC_INFO",
+			EnvFunc: EnvFuncGenerator(map[string]string{
+				"KUBERNETES_EXEC_INFO": `{{"kind":"ExecCredential",`,
+			}),
+			ExpectedErr: errors.New(`unable to parse KUBERNETES_EXEC_INFO: invalid character '{' looking for beginning of object key string`),
+		},
+		{
+			Name: "empty KUBERNETES_EXEC_INFO",
+			EnvFunc: EnvFuncGenerator(map[string]string{
+				"KUBERNETES_EXEC_INFO": "",
+			}),
 			ExpectApiVersion: clientauthv1beta1.SchemeGroupVersion.String(),
 		},
 		{
 			Name:             "KUBERNETES_EXEC_INFO with v1beta1",
-			EnvKey:           "KUBERNETES_EXEC_INFO",
 			ExpectApiVersion: clientauthv1beta1.SchemeGroupVersion.String(),
 		},
 		{
 			Name:             "KUBERNETES_EXEC_INFO with v1alpha1",
-			EnvKey:           "KUBERNETES_EXEC_INFO",
 			ExpectApiVersion: clientauthv1alpha1.SchemeGroupVersion.String(),
 		},
 		{
 			Name:             "KUBERNETES_EXEC_INFO with v1",
-			EnvKey:           "KUBERNETES_EXEC_INFO",
 			ExpectApiVersion: clientauthv1.SchemeGroupVersion.String(),
+		},
+		{
+			Name:             "KUBERNETES_EXEC_INFO with v2",
+			ExpectApiVersion: "client.authentication.k8s.io/v2",
+			ExpectedErr:      errors.New(`invalid apiVersion: client.authentication.k8s.io/v2`),
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
 			expiry, _ := time.Parse(time.RFC3339, "2012-11-01T22:08:41+00:00")
 			token := "token"
-			g, _ := NewGenerator(true, true)
-
-			if c.EnvKey != "" {
-				marshal := make([]byte, 0)
-				if !c.IsMalformedEnv {
-					marshal, _ = json.Marshal(clientauthentication.ExecCredential{
-						TypeMeta: v1.TypeMeta{
-							Kind:       "ExecCredential",
-							APIVersion: c.ExpectApiVersion,
-						},
-					})
-				}
-
-				os.Setenv(c.EnvKey, string(marshal))
+			g := generator{
+				forwardSessionName: true,
+				cache:              true,
+				getEnvFunc:         os.Getenv,
+			}
+			if c.EnvFunc != nil {
+				g.getEnvFunc = c.EnvFunc
+			} else {
+				marshal, _ := json.Marshal(clientauthentication.ExecCredential{
+					TypeMeta: v1.TypeMeta{
+						Kind:       "ExecCredential",
+						APIVersion: c.ExpectApiVersion,
+					},
+				})
+				g.getEnvFunc = EnvFuncGenerator(map[string]string{
+					execInfoEnvKey: string(marshal),
+				})
 			}
 
-			jsonResponse := g.FormatJSON(Token{Token: token, Expiration: expiry})
+			jsonResponse, err := g.FormatJSON(Token{Token: token, Expiration: expiry})
+			if err != nil {
+				if c.ExpectedErr != nil && c.ExpectedErr.Error() != err.Error() {
+					t.Errorf("Unexpected error formatting token: got \n%s\n, wanted \n%s", err, c.ExpectedErr)
+					return
+				}
+				if c.ExpectedErr == nil {
+					t.Errorf("Unexpected error formatting token: %s", err)
+					return
+				}
+			}
+			if c.ExpectedErr != nil {
+				if err == nil {
+					t.Errorf("Missing expected error formatting token: %s", c.ExpectedErr.Error())
+				}
+				return
+			}
+
 			output := &clientauthentication.ExecCredential{}
 			json.Unmarshal([]byte(jsonResponse), output)
 
@@ -398,7 +438,6 @@ func TestFormatJson(t *testing.T) {
 				t.Errorf("expected expiration to be %s but was %s", expiry, output.Status.ExpirationTimestamp)
 			}
 
-			os.Unsetenv(c.EnvKey)
 		})
 	}
 }
